@@ -63,6 +63,7 @@ to ensure absolute stability and preserve the user's copied files.
 #include <vector>
 #include <cwctype> 
 #include <shlwapi.h>
+#include <exdisp.h>
 
 // Manual GUIDs to avoid linker errors
 const CLSID CLSID_CUIAutomation_Manual = { 0xff48dba4, 0x60ef, 0x4201, { 0xaa, 0x87, 0x54, 0x10, 0x3e, 0xef, 0x59, 0x4e } };
@@ -76,6 +77,8 @@ HHOOK g_hMouseHook = NULL;
 DWORD g_dwCurrentPID = 0;
 HANDLE g_hThread = NULL;
 DWORD g_dwThreadId = 0;
+
+void AnalyzeElement(POINT pt);
 
 // ============================================================================
 // UTILS
@@ -117,76 +120,24 @@ std::wstring AscendPath(std::wstring path, int levels) {
 // ----------------------------------------------------------------------------
 // LOGIC: VISUAL GEOMETRY
 // ----------------------------------------------------------------------------
-int CountVisuallyToRight(IUIAutomation* pAutomation, IUIAutomationElement* pClickedItem) {
-    if (!pClickedItem) return -1;
-
-    RECT rcClicked = {};
-    if (FAILED(pClickedItem->get_CurrentBoundingRectangle(&rcClicked))) return -1;
-    
-    IUIAutomationTreeWalker* pWalker = NULL;
-    pAutomation->get_ControlViewWalker(&pWalker);
-    IUIAutomationElement* pRoot = NULL;
-    
-    IUIAutomationElement* pTemp = pClickedItem;
-    pTemp->AddRef();
-    while(true) {
-        IUIAutomationElement* pParent = NULL;
-        pWalker->GetParentElement(pTemp, &pParent);
-        pTemp->Release();
-        pTemp = pParent;
-        if (pTemp) {
-            CONTROLTYPEID tid = 0;
-            pTemp->get_CurrentControlType(&tid);
-            if (tid == 50032) { // Window
-                pRoot = pTemp;
-                pRoot->AddRef();
-                break;
-            }
-        } else {
-            break;
-        }
-    }
-    if (pTemp) pTemp->Release();
-    pWalker->Release();
-
-    if (!pRoot) return -1;
+int CountVisuallyToRight(IUIAutomationTreeWalker* pWalker, IUIAutomationElement* pClickedItem) {
+    if (!pClickedItem || !pWalker) return -1;
 
     int itemsToRight = 0;
-    IUIAutomationElementArray* pFound = NULL;
-    IUIAutomationCondition* pCondition = NULL;
-    
-    VARIANT varProp;
-    VariantInit(&varProp);
-    varProp.vt = VT_BSTR;
-    varProp.bstrVal = SysAllocString(L"FileExplorerExtensions.BreadcrumbBarItemControl");
-    
-    if (SUCCEEDED(pAutomation->CreatePropertyCondition(UIA_ClassNamePropertyId, varProp, &pCondition))) {
-        if (SUCCEEDED(pRoot->FindAll(TreeScope_Descendants, pCondition, &pFound)) && pFound) {
-            int count = 0;
-            pFound->get_Length(&count);
-            for (int i = 0; i < count; i++) {
-                IUIAutomationElement* pItem = NULL;
-                pFound->GetElement(i, &pItem);
-                if (pItem) {
-                    RECT rcItem = {};
-                    if (SUCCEEDED(pItem->get_CurrentBoundingRectangle(&rcItem))) {
-                        // Check if strictly right
-                        if (abs(rcItem.top - rcClicked.top) < 20) { 
-                            if (rcItem.left > rcClicked.left) { 
-                                itemsToRight++;
-                            }
-                        }
-                    }
-                    pItem->Release();
-                }
-            }
-            pFound->Release();
-        }
-        pCondition->Release();
-    }
-    VariantClear(&varProp);
-    pRoot->Release();
+    IUIAutomationElement* pCurrent = pClickedItem;
+    pCurrent->AddRef();
 
+    while (pCurrent) {
+        IUIAutomationElement* pNext = NULL;
+        if (SUCCEEDED(pWalker->GetNextSiblingElement(pCurrent, &pNext)) && pNext) {
+            itemsToRight++;
+            pCurrent->Release();
+            pCurrent = pNext;
+        } else {
+            pCurrent->Release();
+            pCurrent = NULL;
+        }
+    }
     return itemsToRight;
 }
 
@@ -204,16 +155,16 @@ std::wstring ProbeAddressBarWithUIA(IUIAutomation* pAutomation) {
     inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = 'D'; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
     inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_MENU; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
     SendInput(idx, inputs, sizeof(INPUT));
-    
+
     // Wait for XAML animation and focus shift
-    Sleep(150); 
+    Sleep(40); 
 
     // 2. Read the focused element using UIA
     IUIAutomationElement* pFocusedElement = NULL;
     if (SUCCEEDED(pAutomation->GetFocusedElement(&pFocusedElement)) && pFocusedElement) {
-        
-        // Try to get the Value Pattern (standard for edit boxes)
         IUIAutomationValuePattern* pValuePattern = NULL;
+
+        // Try to get the Value Pattern (standard for edit boxes)
         if (SUCCEEDED(pFocusedElement->GetCurrentPattern(UIA_ValuePatternId, (IUnknown**)&pValuePattern)) && pValuePattern) {
             BSTR valBstr = NULL;
             if (SUCCEEDED(pValuePattern->get_CurrentValue(&valBstr)) && valBstr) {
@@ -223,7 +174,6 @@ std::wstring ProbeAddressBarWithUIA(IUIAutomation* pAutomation) {
             pValuePattern->Release();
         }
         
-        // Fallback: If Value Pattern fails, try getting the Name property
         if (foundPath.empty()) {
             BSTR nameBstr = NULL;
             if (SUCCEEDED(pFocusedElement->get_CurrentName(&nameBstr)) && nameBstr) {
@@ -234,86 +184,78 @@ std::wstring ProbeAddressBarWithUIA(IUIAutomation* pAutomation) {
         pFocusedElement->Release();
     }
 
-    // 3. Esc to exit address bar edit mode
     memset(inputs, 0, sizeof(inputs)); idx = 0;
     inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_ESCAPE; idx++;
     inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_ESCAPE; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
     SendInput(idx, inputs, sizeof(INPUT));
     
-    Sleep(50); 
+    Sleep(10); 
 
     return foundPath;
 }
 
 // ============================================================================
-// NAVIGATION (UNICODE INJECTION - NO CLIPBOARD)
+// NAVIGATION
 // ============================================================================
-void TypeUnicodeString(const std::wstring& text) {
-    if (text.empty()) return;
-
-    std::vector<INPUT> inputs;
-    inputs.reserve(text.length() * 2);
-
-    for (wchar_t c : text) {
-        INPUT inDown = {};
-        inDown.type = INPUT_KEYBOARD;
-        inDown.ki.wVk = 0; // wVk must be 0 for Unicode
-        inDown.ki.wScan = c;
-        inDown.ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs.push_back(inDown);
-
-        INPUT inUp = {};
-        inUp.type = INPUT_KEYBOARD;
-        inUp.ki.wVk = 0;
-        inUp.ki.wScan = c;
-        inUp.ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
-        inputs.push_back(inUp);
-    }
-
-    if (!inputs.empty()) {
-        SendInput((UINT)inputs.size(), inputs.data(), sizeof(INPUT));
-    }
-}
-
 void NavigateNewTab(const std::wstring& targetPath) {
     if (targetPath.length() < 2) return;
 
-    INPUT inputs[4] = {};
-    int idx = 0;
+    HWND hForeground = GetForegroundWindow();
+    wchar_t cls[256] = {0};
+    GetClassNameW(hForeground, cls, 256);
+    if (wcscmp(cls, L"CabinetWClass") != 0) return;
+
+    HWND hShellTab = FindWindowExW(hForeground, NULL, L"ShellTabWindowClass", NULL);
+    if (!hShellTab) return;
+
+    SendMessageW(hShellTab, WM_COMMAND, 0xA21B, 0);
     
-    // 1. Ctrl+T (New Tab)
-    idx = 0; memset(inputs, 0, sizeof(inputs));
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_CONTROL; idx++;
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = 'T'; idx++;
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = 'T'; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_CONTROL; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
-    SendInput(idx, inputs, sizeof(INPUT));
-    Sleep(450); // Wait for tab creation
+    Sleep(50); 
 
-    // 2. Alt+D (Focus Address Bar)
-    idx = 0; memset(inputs, 0, sizeof(inputs));
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_MENU; idx++; 
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = 'D'; idx++;
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = 'D'; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_MENU; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
-    SendInput(idx, inputs, sizeof(INPUT));
-    Sleep(150); // Wait for focus
-
-    // 3. Inject Path directly (Bypasses Clipboard)
-    TypeUnicodeString(targetPath);
-    Sleep(50);
-
-    // 4. Enter
-    idx = 0; memset(inputs, 0, sizeof(inputs));
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_RETURN; idx++;
-    inputs[idx].type = INPUT_KEYBOARD; inputs[idx].ki.wVk = VK_RETURN; inputs[idx].ki.dwFlags = KEYEVENTF_KEYUP; idx++;
-    SendInput(idx, inputs, sizeof(INPUT));
+    IShellWindows* pShellWindows = NULL;
+    if (SUCCEEDED(CoCreateInstance(CLSID_ShellWindows, NULL, CLSCTX_ALL, IID_PPV_ARGS(&pShellWindows)))) {
+        long count = 0;
+        pShellWindows->get_Count(&count);
+        
+        for (long i = count - 1; i >= 0; i--) {
+            VARIANT vIdx;
+            vIdx.vt = VT_I4;
+            vIdx.lVal = i;
+            
+            IDispatch* pDisp = NULL;
+            if (SUCCEEDED(pShellWindows->Item(vIdx, &pDisp)) && pDisp) {
+                IWebBrowser2* pBrowser = NULL;
+                if (SUCCEEDED(pDisp->QueryInterface(IID_PPV_ARGS(&pBrowser))) && pBrowser) {
+                    HWND hBrowserWnd = NULL;
+                    pBrowser->get_HWND((SHANDLE_PTR*)&hBrowserWnd);
+                    
+                    if (GetAncestor(hBrowserWnd, GA_ROOT) == hForeground) {
+                        BSTR bstrUrl = SysAllocString(targetPath.c_str());
+                        VARIANT vEmpty = {0};
+                        
+                        pBrowser->Navigate2(&vEmpty, &vEmpty, &vEmpty, &vEmpty, &vEmpty); 
+                        pBrowser->Navigate(bstrUrl, &vEmpty, &vEmpty, &vEmpty, &vEmpty);
+                        
+                        SysFreeString(bstrUrl);
+                        pBrowser->Release();
+                        pDisp->Release();
+                        break;
+                    }
+                    pBrowser->Release();
+                }
+                pDisp->Release();
+            }
+        }
+        pShellWindows->Release();
+    }
 }
 
 // ----------------------------------------------------------------------------
 // LOGIC: DROPDOWN MENU SUPPORT
 // ----------------------------------------------------------------------------
-IUIAutomationElement* FindExpandedBreadcrumbElement(IUIAutomation* pAutomation, IUIAutomationElement* pMainWin) {
+IUIAutomationElement* FindExpandedBreadcrumbElement(IUIAutomation* pAutomation, IUIAutomationTreeWalker* pWalker, IUIAutomationElement* pMainWin) {
+    if (!pWalker) return NULL;
+
     IUIAutomationCondition* pCondExpanded = NULL;
     VARIANT varState;
     VariantInit(&varState);
@@ -327,9 +269,6 @@ IUIAutomationElement* FindExpandedBreadcrumbElement(IUIAutomation* pAutomation, 
             int count = 0;
             pFound->get_Length(&count);
             
-            IUIAutomationTreeWalker* pWalker = NULL;
-            pAutomation->get_ControlViewWalker(&pWalker);
-
             for (int i = 0; i < count; i++) {
                 IUIAutomationElement* pItem = NULL;
                 pFound->GetElement(i, &pItem);
@@ -338,7 +277,6 @@ IUIAutomationElement* FindExpandedBreadcrumbElement(IUIAutomation* pAutomation, 
                     IUIAutomationElement* pTemp = pItem;
                     pTemp->AddRef();
                     
-                    // Traverse up to verify it belongs to the BreadcrumbBar
                     for (int j = 0; j < 10; j++) {
                         BSTR clsName = NULL;
                         pTemp->get_CurrentClassName(&clsName);
@@ -350,7 +288,7 @@ IUIAutomationElement* FindExpandedBreadcrumbElement(IUIAutomation* pAutomation, 
                         if (clsName) SysFreeString(clsName);
                         
                         IUIAutomationElement* pPar = NULL;
-                        if (pWalker) pWalker->GetParentElement(pTemp, &pPar);
+                        pWalker->GetParentElement(pTemp, &pPar);
                         pTemp->Release();
                         pTemp = pPar;
                         if (!pTemp) break;
@@ -358,14 +296,13 @@ IUIAutomationElement* FindExpandedBreadcrumbElement(IUIAutomation* pAutomation, 
                     if (pTemp) pTemp->Release();
 
                     if (inBreadcrumb) {
-                        pResult = pItem; // Found the expanded chevron/breadcrumb
+                        pResult = pItem; 
                         break;
                     } else {
                         pItem->Release();
                     }
                 }
             }
-            if (pWalker) pWalker->Release();
             pFound->Release();
         }
         pCondExpanded->Release();
@@ -423,7 +360,7 @@ void AnalyzeElement(POINT pt) {
                      NavigateNewTab(drivePath);
                  } 
                  else {
-                     int levelsUp = CountVisuallyToRight(pAutomation, pBreadcrumbItem);
+                     int levelsUp = CountVisuallyToRight(pWalker, pBreadcrumbItem);
                      if (levelsUp >= 0) {
                          std::wstring fullPath = ProbeAddressBarWithUIA(pAutomation);
                          if (!fullPath.empty()) {
@@ -441,29 +378,24 @@ void AnalyzeElement(POINT pt) {
                 CONTROLTYPEID tid = 0;
                 pElement->get_CurrentControlType(&tid);
                 
-                // Verify it's a menu/list item to prevent random text clicks
                 if (tid == UIA_TextControlTypeId || tid == UIA_ListItemControlTypeId || tid == UIA_MenuItemControlTypeId) {
                     HWND hMainWnd = GetForegroundWindow();
                     wchar_t cls[256] = {0};
                     GetClassNameW(hMainWnd, cls, 256);
                     
-                    // Ensure we are operating within Explorer
                     if (wcscmp(cls, L"CabinetWClass") == 0) {
                         IUIAutomationElement* pMainWin = NULL;
                         if (SUCCEEDED(pAutomation->ElementFromHandle(hMainWnd, &pMainWin)) && pMainWin) {
                             
-                            // Find which breadcrumb chevron is currently expanded
-                            IUIAutomationElement* pExpandedBreadcrumb = FindExpandedBreadcrumbElement(pAutomation, pMainWin);
+                            IUIAutomationElement* pExpandedBreadcrumb = FindExpandedBreadcrumbElement(pAutomation, pWalker, pMainWin);
                             if (pExpandedBreadcrumb) {
-                                int levelsUp = CountVisuallyToRight(pAutomation, pExpandedBreadcrumb);
+                                int levelsUp = CountVisuallyToRight(pWalker, pExpandedBreadcrumb);
                                 if (levelsUp >= 0) {
                                     std::wstring fullPath = ProbeAddressBarWithUIA(pAutomation);
-                                    // Note: ProbeAddressBarWithUIA triggers Alt+D, automatically closing the dropdown!
                                     
                                     if (!fullPath.empty()) {
                                         std::wstring targetPath = AscendPath(fullPath, levelsUp);
                                         if (!targetPath.empty()) {
-                                            // Combine with clicked subfolder
                                             if (targetPath.back() != L'\\') targetPath += L"\\";
                                             targetPath += clickedName;
                                             
@@ -479,7 +411,7 @@ void AnalyzeElement(POINT pt) {
                 }
             }
             
-            pWalker->Release();
+            if (pWalker) pWalker->Release();
             pElement->Release();
         }
         pAutomation->Release();
@@ -487,8 +419,21 @@ void AnalyzeElement(POINT pt) {
 }
 
 // ============================================================================
-// HOOKS
+// HOOKS & ASYNC WORKER THREAD
 // ============================================================================
+DWORD WINAPI AnalyzeElementWorkerThread(LPVOID lpParam) {
+    POINT* pPt = static_cast<POINT*>(lpParam);
+    if (pPt) {
+        POINT pt = *pPt;
+        delete pPt; 
+        
+        CoInitializeEx(NULL, COINIT_MULTITHREADED);
+        AnalyzeElement(pt);
+        CoUninitialize();
+    }
+    return 0;
+}
+
 LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION && wParam == WM_MBUTTONUP) {
         MSLLHOOKSTRUCT* pMouse = (MSLLHOOKSTRUCT*)lParam;
@@ -496,14 +441,19 @@ LRESULT CALLBACK LowLevelMouseProc(int nCode, WPARAM wParam, LPARAM lParam) {
         DWORD targetPID = 0;
         GetWindowThreadProcessId(hWndTarget, &targetPID);
         if (targetPID == g_dwCurrentPID) {
-            AnalyzeElement(pMouse->pt);
+            POINT* pPt = new POINT(pMouse->pt);
+            HANDLE hWorker = CreateThread(NULL, 0, AnalyzeElementWorkerThread, pPt, 0, NULL);
+            if (hWorker) {
+                CloseHandle(hWorker); 
+            } else {
+                delete pPt; 
+            }
         }
     }
     return CallNextHookEx(g_hMouseHook, nCode, wParam, lParam);
 }
 
 DWORD WINAPI HookThreadProc(LPVOID lpParam) {
-    CoInitializeEx(NULL, COINIT_MULTITHREADED);
     g_dwThreadId = GetCurrentThreadId();
     g_hMouseHook = SetWindowsHookEx(WH_MOUSE_LL, LowLevelMouseProc, GetModuleHandle(NULL), 0);
     if (g_hMouseHook) {
@@ -514,7 +464,6 @@ DWORD WINAPI HookThreadProc(LPVOID lpParam) {
         }
         UnhookWindowsHookEx(g_hMouseHook);
     }
-    CoUninitialize();
     return 0;
 }
 
