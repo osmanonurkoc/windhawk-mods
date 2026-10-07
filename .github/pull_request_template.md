@@ -18,7 +18,7 @@ If this pull request introduces a new mod, please complete the section below.
 This mod was created by:
 
 - - [ ] The submitter, without AI assistance
-- - [ ] The submitter, with AI assistance
+- - [x] The submitter, with AI assistance
 - - [ ] Claude
 - - [ ] ChatGPT
 - - [ ] Gemini
